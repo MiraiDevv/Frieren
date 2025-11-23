@@ -1,6 +1,10 @@
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use tauri::{Emitter, Window};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct VideoFormat {
@@ -37,11 +41,13 @@ async fn get_video_info(url: String) -> Result<Vec<QualityOption>, String> {
     }
 
     // Use --dump-json to get video metadata
+    // Use --dump-json to get video metadata
     let output = Command::new(bin_path)
         .args(&["--dump-json", "--no-playlist", url.as_str()])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
+        .await
         .map_err(|e| format!("Failed to execute yt-dlp: {}", e))?;
 
     if !output.status.success() {
@@ -133,86 +139,197 @@ async fn get_video_info(url: String) -> Result<Vec<QualityOption>, String> {
     Ok(quality_options)
 }
 
+#[derive(Clone, Serialize)]
+struct LogMessage {
+    message_type: String,
+    message: String,
+}
+
+#[derive(Clone, Serialize)]
+struct DownloadProgress {
+    progress: f64,
+    status: String,
+}
+
 #[tauri::command]
-async fn download_media(url: String, format: String, quality: String) -> Result<String, String> {
+async fn download_media(
+    window: Window,
+    url: String,
+    format: String,
+    quality: String,
+    download_path: Option<String>,
+) -> Result<String, String> {
     println!(
-        "Downloading: {} (Format: {}, Quality: {})",
-        url, format, quality
+        "Downloading: {} (Format: {}, Quality: {}, Path: {:?})",
+        url, format, quality, download_path
+    );
+
+    // Emit initial log to frontend
+    let _ = window.emit(
+        "download-log",
+        LogMessage {
+            message_type: "stdout".to_string(),
+            message: format!(
+                "Starting download... URL: {}, Path: {:?}",
+                url, download_path
+            ),
+        },
     );
 
     let bin_path = Path::new("bin/yt-dlp.exe");
+    println!("Checking for yt-dlp.exe at: {:?}", bin_path);
+    println!("Current dir: {:?}", std::env::current_dir());
     if !bin_path.exists() {
-        return Err("yt-dlp.exe not found in bin directory".to_string());
+        let err_msg = format!(
+            "yt-dlp.exe not found in bin directory. Current dir: {:?}, Checked path: {:?}",
+            std::env::current_dir(),
+            bin_path
+        );
+        println!("{}", err_msg);
+        return Err(err_msg);
     }
+    println!("yt-dlp.exe found, building args...");
 
     let mut args = Vec::new();
-    args.push(url.as_str());
+    args.push(url.clone());
+    args.push("--newline".to_string()); // Ensure line-buffered output
+    args.push("--progress".to_string()); // Force progress output
 
     // Output template to Downloads folder or current dir
-    args.push("-o");
-    args.push("%(title)s.%(ext)s");
+    // Set download path if provided
+    if let Some(path) = download_path {
+        args.push("-P".to_string());
+        args.push(path);
+    }
+
+    // Output template for filename only
+    args.push("-o".to_string());
+    args.push("%(title)s.%(ext)s".to_string());
 
     // Handle format and quality selection
-    // If quality is a specific format ID (not "best" or "worst"), use it directly
     if quality != "best" && quality != "worst" {
-        args.push("-f");
-        args.push(quality.as_str());
+        args.push("-f".to_string());
+        args.push(quality.clone());
     } else {
-        // Use default best/worst logic
         match (format.as_str(), quality.as_str()) {
             ("video_audio", "best") | ("video+audio", "best") => {
-                args.push("-f");
-                args.push("bv+ba/b");
+                args.push("-f".to_string());
+                args.push("bv+ba/b".to_string());
             }
             ("video_audio", "worst") | ("video+audio", "worst") => {
-                args.push("-f");
-                args.push("wv+wa/w");
+                args.push("-f".to_string());
+                args.push("wv+wa/w".to_string());
             }
             ("video_only", "best") | ("video", "best") => {
-                args.push("-f");
-                args.push("bv");
+                args.push("-f".to_string());
+                args.push("bv".to_string());
             }
             ("video_only", "worst") | ("video", "worst") => {
-                args.push("-f");
-                args.push("wv");
+                args.push("-f".to_string());
+                args.push("wv".to_string());
             }
             ("audio_only", "best") | ("audio", "best") => {
-                args.push("-x");
-                args.push("--audio-quality");
-                args.push("0");
+                args.push("-x".to_string());
+                args.push("--audio-quality".to_string());
+                args.push("0".to_string());
             }
             ("audio_only", "worst") | ("audio", "worst") => {
-                args.push("-x");
-                args.push("--audio-quality");
-                args.push("10");
+                args.push("-x".to_string());
+                args.push("--audio-quality".to_string());
+                args.push("10".to_string());
             }
             _ => {
-                // Default to best
-                args.push("-f");
-                args.push("bv+ba/b");
+                args.push("-f".to_string());
+                args.push("bv+ba/b".to_string());
             }
         }
     }
 
+    println!("Spawning yt-dlp with args: {:?}", args);
+
     // Create a new command
-    let output = Command::new(bin_path)
+    let mut child = Command::new(bin_path)
         .args(&args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| e.to_string())?;
+        .stderr(Stdio::piped()) // Capture stderr
+        .spawn()
+        .map_err(|e| {
+            let err_msg = format!("Failed to spawn yt-dlp: {}", e);
+            println!("{}", err_msg);
+            err_msg
+        })?;
 
-    if output.status.success() {
+    println!("yt-dlp spawned successfully, reading output...");
+
+    let stdout = child.stdout.take().ok_or("Failed to open stdout")?;
+    let stderr = child.stderr.take().ok_or("Failed to open stderr")?;
+
+    let mut stdout_reader = BufReader::new(stdout).lines();
+    let mut stderr_reader = BufReader::new(stderr).lines();
+
+    // Regex to capture progress percentage
+    let progress_regex = Regex::new(r"(\d+\.?\d*)%").map_err(|e| e.to_string())?;
+
+    // Spawn a task to read stderr concurrently so it doesn't block
+    let window_clone = window.clone();
+    tokio::spawn(async move {
+        while let Ok(Some(line)) = stderr_reader.next_line().await {
+            println!("yt-dlp stderr: {}", line);
+            let _ = window_clone.emit(
+                "download-log",
+                LogMessage {
+                    message_type: "stderr".to_string(),
+                    message: line,
+                },
+            );
+        }
+    });
+
+    println!("Starting to read stdout...");
+    while let Ok(Some(line)) = stdout_reader.next_line().await {
+        println!("yt-dlp stdout: {}", line); // Log output for debugging
+
+        let _ = window.emit(
+            "download-log",
+            LogMessage {
+                message_type: "stdout".to_string(),
+                message: line.clone(),
+            },
+        );
+
+        if let Some(caps) = progress_regex.captures(&line) {
+            if let Some(match_) = caps.get(1) {
+                if let Ok(progress) = match_.as_str().parse::<f64>() {
+                    let _ = window.emit(
+                        "download-progress",
+                        DownloadProgress {
+                            progress,
+                            status: "downloading".to_string(),
+                        },
+                    );
+                }
+            }
+        }
+    }
+    println!("Finished reading stdout.");
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("Failed to wait on child: {}", e))?;
+    println!("yt-dlp exit status: {}", status);
+
+    if status.success() {
         Ok("Download successful".to_string())
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("Download failed: {}", stderr))
+        Err(format!("Download failed with status: {}", status))
     }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             greet,

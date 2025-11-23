@@ -1,9 +1,12 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 import { Layout } from "./components/Layout";
 import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
 import { Label } from "./components/ui/label";
+import { Progress } from "./components/ui/progress";
 import {
   Select,
   SelectContent,
@@ -12,13 +15,24 @@ import {
   SelectValue,
 } from "./components/ui/select";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./components/ui/card";
-import { Download, Loader2, Info } from "lucide-react";
+import { Download, Loader2, Info, FolderOpen, Terminal } from "lucide-react";
 import { toast } from "sonner";
+import { LogViewer } from "./components/LogViewer";
 
 interface QualityOption {
   id: string;
   label: string;
   format_type: string;
+}
+
+interface LogMessage {
+  type: "stdout" | "stderr";
+  message: string;
+}
+
+interface BackendLogMessage {
+  message_type: string;
+  message: string;
 }
 
 function App() {
@@ -27,7 +41,21 @@ function App() {
   const [quality, setQuality] = useState("best");
   const [isDownloading, setIsDownloading] = useState(false);
   const [isFetchingInfo, setIsFetchingInfo] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [downloadPath, setDownloadPath] = useState<string | null>(null);
   const [availableQualities, setAvailableQualities] = useState<QualityOption[]>([]);
+  const [logs, setLogs] = useState<LogMessage[]>([]);
+  const [isLogViewerOpen, setIsLogViewerOpen] = useState(false);
+
+  useEffect(() => {
+    const unlisten = listen<BackendLogMessage>("download-log", (event) => {
+      setLogs((prev) => [...prev, { type: event.payload.message_type as "stdout" | "stderr", message: event.payload.message }]);
+    });
+
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
 
   async function handleFetchVideoInfo() {
     if (!url) {
@@ -55,20 +83,47 @@ function App() {
     }
 
     setIsDownloading(true);
+    setProgress(0);
+    setLogs([]); // Clear logs on new download
+
+    // Listen for progress events
+    const unlisten = await listen<{ progress: number; status: string }>(
+      "download-progress",
+      (event) => {
+        setProgress(event.payload.progress);
+      }
+    );
+
     try {
-      await invoke("download_media", { url, format, quality });
+      await invoke("download_media", {
+        url,
+        format,
+        quality,
+        downloadPath: downloadPath,
+      });
       toast.success("Download started successfully!");
+      setProgress(100);
     } catch (error) {
       console.error(error);
       toast.error(`Failed to start download: ${error}`);
     } finally {
       setIsDownloading(false);
+      unlisten();
     }
   }
 
   return (
     <Layout>
-      <div className="container mx-auto p-6 max-w-5xl h-full flex flex-col justify-center">
+      <div className="container mx-auto p-6 max-w-5xl h-full flex flex-col justify-center relative">
+        <Button
+          variant="ghost"
+          size="icon"
+          className="absolute top-6 right-6 text-muted-foreground hover:text-foreground"
+          onClick={() => setIsLogViewerOpen(true)}
+        >
+          <Terminal className="h-5 w-5" />
+        </Button>
+
         <Card className="border-none shadow-none bg-transparent">
           <CardHeader className="text-center space-y-2">
             <CardTitle className="text-3xl font-bold tracking-tight">
@@ -100,6 +155,32 @@ function App() {
                   ) : (
                     <Info className="h-4 w-4" />
                   )}
+                </Button>
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <Label>Download Location</Label>
+              <div className="flex gap-2">
+                <Input
+                  readOnly
+                  value={downloadPath || "Default (Downloads folder)"}
+                  className="h-11 bg-muted/50"
+                />
+                <Button
+                  variant="outline"
+                  className="h-11 px-4"
+                  onClick={async () => {
+                    const selected = await open({
+                      directory: true,
+                      multiple: false,
+                    });
+                    if (selected) {
+                      setDownloadPath(selected as string);
+                    }
+                  }}
+                >
+                  <FolderOpen className="h-4 w-4" />
                 </Button>
               </div>
             </div>
@@ -151,7 +232,7 @@ function App() {
               {isDownloading ? (
                 <>
                   <Loader2 className="mr-2 h-5 w-5 animate-spin" />
-                  Downloading...
+                  Downloading... {progress.toFixed(1)}%
                 </>
               ) : (
                 <>
@@ -160,8 +241,25 @@ function App() {
                 </>
               )}
             </Button>
+
+            {isDownloading && (
+              <div className="space-y-2 animate-in fade-in slide-in-from-bottom-4">
+                <Progress value={progress} className="h-2" />
+                <p className="text-sm text-center text-muted-foreground">
+                  {progress < 100
+                    ? "Please wait while we download your media..."
+                    : "Finalizing download..."}
+                </p>
+              </div>
+            )}
           </CardContent>
         </Card>
+
+        <LogViewer
+          isOpen={isLogViewerOpen}
+          onOpenChange={setIsLogViewerOpen}
+          logs={logs}
+        />
       </div>
     </Layout>
   );
