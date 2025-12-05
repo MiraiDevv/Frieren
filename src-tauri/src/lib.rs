@@ -209,7 +209,15 @@ async fn download_media(
     // Handle format and quality selection
     if quality != "best" && quality != "worst" {
         args.push("-f".to_string());
-        args.push(quality.clone());
+        // When user selects a specific quality with video+audio format,
+        // combine that video format with best audio
+        if format == "video+audio" || format == "video_audio" {
+            args.push(format!("{}+ba/b", quality)); // selected video + best audio, fallback to best
+        } else if format == "audio" || format == "audio_only" {
+            args.push("ba".to_string()); // Just best audio
+        } else {
+            args.push(quality.clone()); // video only - use the format as-is
+        }
     } else {
         match (format.as_str(), quality.as_str()) {
             ("video_audio", "best") | ("video+audio", "best") => {
